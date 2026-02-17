@@ -44,6 +44,7 @@ class AIProcessor:
             },
             json={
                 "model": self.model,
+                "reasoning_effort": "none",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
