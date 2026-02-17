@@ -4,9 +4,11 @@
 无 Web GUI，所有接口返回 JSON。
 
 接口列表：
-- POST /api/resolve    解析视频，返回下载地址、标题、作者
-- POST /api/transcript 解析视频 + 语音转文字 + AI润色，返回完整文案
-- POST /api/email      解析视频 + 转写 + AI润色 + 发送邮件
+- POST /api/resolve      解析视频，返回下载地址、标题、作者
+- POST /api/transcript   解析视频 + 语音转文字 + AI润色，返回完整文案
+- POST /api/save_feishu  解析视频 + 转写 + AI润色 + 保存到飞书
+- POST /api/email        解析视频 + 转写 + AI润色 + 发送邮件
+- GET  /api/download     代理下载视频（绕过防盗链）
 
 启动: gunicorn -w 2 -b 0.0.0.0:3102 --timeout 180 app:app
 """
@@ -16,7 +18,7 @@ import os
 import time
 
 import requests as http_requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 
 from config import Config
 from video_resolver import VideoResolver, extract_url_from_text, resolve_short_url, extract_aweme_id
@@ -82,11 +84,20 @@ def _resolve_video(url: str) -> dict:
 
 
 def _transcribe_video(play_url: str) -> dict:
-    """转写视频语音"""
+    """转写视频语音
+    
+    将播放地址转换为本地代理地址，让火山引擎通过我们的服务器下载视频
+    """
     transcriber = get_transcriber()
     if not transcriber:
         return {"success": False, "error": "转写功能未配置"}
-    result = transcriber.transcribe(play_url)
+    
+    # 使用本地代理地址，绕过抖音防盗链
+    # 火山引擎会通过我们的服务器下载视频
+    proxy_url = f"http://127.0.0.1:3102/api/download?url={play_url}"
+    logger.info(f"使用代理地址进行转写: {proxy_url}")
+    
+    result = transcriber.transcribe(proxy_url)
     if result.error:
         return {"success": False, "error": result.error}
     return {"success": True, "text": result.text, "duration": round(result.duration, 1)}
@@ -260,6 +271,67 @@ def api_email():
         return jsonify({"success": False, "error": result.error})
 
 
+@app.route("/api/download")
+def api_download():
+    """接口5: 代理下载视频（绕过抖音 Referer 防盗链）
+    
+    请求: GET /api/download?url=播放地址&title=视频标题(可选)
+    响应: 视频文件流
+    """
+    video_url = request.args.get("url", "").strip()
+    title = request.args.get("title", "video").strip() or "video"
+    if not video_url:
+        return jsonify({"success": False, "error": "缺少 url 参数"}), 400
+
+    import re
+    from urllib.parse import quote
+    # 清理文件名，只保留中文、英文、数字、下划线和连字符
+    safe_title = re.sub(r'[^\w\u4e00-\u9fff\-]', '_', title)[:60]
+    # URL 编码文件名，支持中文
+    encoded_title = quote(safe_title)
+
+    try:
+        # 使用移动端 UA 和 Referer，模拟手机浏览器访问
+        headers = {
+            "user-agent": (
+                "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/116.0.0.0 Mobile Safari/537.36"
+            ),
+            "referer": "https://www.douyin.com/",
+        }
+        
+        # 请求视频，allow_redirects=True 会自动跟踪 302 重定向到 CDN
+        upstream = http_requests.get(
+            video_url, 
+            headers=headers, 
+            stream=True, 
+            timeout=30, 
+            allow_redirects=True
+        )
+        
+        if upstream.status_code != 200:
+            logger.error(f"上游返回 {upstream.status_code}: {video_url}")
+            return jsonify({"success": False, "error": f"上游返回 {upstream.status_code}"}), 502
+
+        content_type = upstream.headers.get("Content-Type", "video/mp4")
+        content_length = upstream.headers.get("Content-Length", "")
+
+        resp_headers = {
+            "Content-Type": content_type,
+            "Content-Disposition": f'attachment; filename="{encoded_title}.mp4"; filename*=UTF-8\'\'{encoded_title}.mp4',
+        }
+        if content_length:
+            resp_headers["Content-Length"] = content_length
+
+        # 流式返回视频内容
+        return Response(upstream.iter_content(chunk_size=65536), headers=resp_headers)
+        
+    except http_requests.RequestException as e:
+        logger.error(f"下载失败: {video_url} - {e}")
+        return jsonify({"success": False, "error": str(e)}), 502
+
+
 @app.route("/health")
 def health():
     """健康检查"""
@@ -277,10 +349,11 @@ if __name__ == "__main__":
     print(f"\n🔌 抖音视频解析 API 服务已启动")
     print(f"   端口: {port}")
     print(f"   接口:")
-    print(f"   POST /api/resolve    - 解析下载地址")
-    print(f"   POST /api/transcript - 获取文案(转写+AI)")
-    print(f"   POST /api/save_feishu - 保存到飞书")
-    print(f"   POST /api/email      - 发送邮件")
-    print(f"   GET  /health         - 健康检查")
+    print(f"   POST /api/resolve      - 解析下载地址")
+    print(f"   POST /api/transcript   - 获取文案(转写+AI)")
+    print(f"   POST /api/save_feishu  - 保存到飞书")
+    print(f"   POST /api/email        - 发送邮件")
+    print(f"   GET  /api/download     - 代理下载视频")
+    print(f"   GET  /health           - 健康检查")
     print()
     app.run(host="0.0.0.0", port=port, debug=False)
